@@ -15,8 +15,10 @@ class Calibration:
     
     left_calibration = None
     right_calibration = None
+    left_fisheye_calibration = None
+    right_fisheye_calibration = None
     stereo_calibration = None
-        
+    
     cameras = {"left":1, "right":0}
     
     rectification_alpha = 0.95
@@ -333,7 +335,7 @@ class Calibration:
         cv2.destroyAllWindows()
        
        
-    def calibrate(self, camera_name):
+    def calibrate(self, camera_name, fisheye=True):
         folder = self.image_folders[camera_name]
         print(f"Opening folder: {folder}")
         images = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".png")]
@@ -368,17 +370,58 @@ class Calibration:
         print(f"Ignored {ignored_images} images of {len(images)}")
         print(f"Calibrating using {len(all_charuco_corners)} corners")
                         
-        retval, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(all_charuco_corners, all_charuco_ids, self.board, image.shape[:2], None, None)
+        
+        if(fisheye == True):
+            K = np.zeros((3, 3))
+            D = np.zeros((4, 1))
+            object_points = []
+            image_points = []
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+
+            for corners, ids in zip(all_charuco_corners, all_charuco_ids):
+                if(len(corners) > 0):
+                    object_points.append(self.board.getChessboardCorners()[ids])
+                    image_points.append(corners)
+            
+            if(camera_name == "left"):
+                camera_matrix = self.left_calibration["camera_matrix"]
+                dist_coeffs = self.left_calibration["dist_coeffs"]        
+            else:
+                camera_matrix = self.right_calibration["camera_matrix"]
+                dist_coeffs = self.right_calibration["dist_coeffs"]
+
+            image_count = len(all_charuco_corners)
+            rvecs = [np.zeros((1, 1, 3), dtype=np.float64) for i in range(image_count)]
+            tvecs = [np.zeros((1, 1, 3), dtype=np.float64) for i in range(image_count)]
+            
+            # object_points.append(self.board.getChessboardCorners()[all_charuco_ids[0], :])
+            # retval, K, D, rvecs, tvecs = cv2.fisheye.calibrate(object_points, image_points, image.shape[:2], K, D)
+            retval, K, D, rvecs, tvecs = cv2.fisheye.calibrate(
+                object_points,
+                image_points,
+                image.shape[:2],
+                camera_matrix,
+                dist_coeffs,
+                rvecs,
+                tvecs,
+                cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC + cv2.fisheye.CALIB_CHECK_COND + cv2.fisheye.CALIB_FIX_SKEW,
+                criteria)
+            
+            print(f"projection error: {retval}")
+            print('K: ', K)
+            print('Distortion coefficients: ', D)
+            np.savez(f"{camera_name}_fisheye", K=K, D=D, rvecs=rvecs, tvecs=tvecs)           
+        else:
+            retval, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(all_charuco_corners, all_charuco_ids, self.board, image.shape[:2], None, None)
+            
+            print(f"camera matrix: {camera_matrix}")
+            print(f"dist coeffs: {dist_coeffs}")
+            np.savez(camera_name, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, rvecs=rvecs, tvecs=tvecs)
+            
+
         print(f"Calibration complete for {camera_name}, error: {retval}")
         
-        print(f"camera matrix: {camera_matrix}")
-        print(f"dist coeffs: {dist_coeffs}")
-        
-        np.savez(camera_name, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, rvecs=rvecs, tvecs=tvecs)
-        
-        return (camera_matrix, dist_coeffs, rvecs, tvecs)
- 
- 
+  
     def stereo_calibrate(self):
         stereo_image_folder = self.image_folders["stereo"]
         left_images = []
@@ -448,15 +491,15 @@ class Calibration:
 
 
         # Now use matched corners to perform stereo calibration
-        if matched_corners_left and matched_corners_right:
+        if len(matched_corners_left) and len(matched_corners_right):
             ret, camera_matrix_left, dist_coeffs_left, camera_matrix_right, dist_coeffs_right, R, T, E, F = cv2.stereoCalibrate(
                 objectPoints=matched_object_points,
                 imagePoints1=matched_corners_left,
                 imagePoints2=matched_corners_right,
-                cameraMatrix1=None,
-                distCoeffs1=None,
-                cameraMatrix2=None,
-                distCoeffs2=None,
+                cameraMatrix1=self.left_calibration['camera_matrix'],
+                distCoeffs1=self.left_calibration['dist_coeffs'],
+                cameraMatrix2=self.right_calibration['camera_matrix'],
+                distCoeffs2=self.right_calibration['dist_coeffs'],
                 imageSize=left_gray.shape[::-1],
                 criteria=(cv2.TERM_CRITERIA_EPS +
                         cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-5),
@@ -483,9 +526,16 @@ class Calibration:
         
         if(os.path.exists('right.npz')):
             self.right_calibration = np.load('right.npz')
+                
+        if(os.path.exists('left_fisheye.npz')):
+            self.left_fisheye_calibration = np.load('left_fisheye.npz')
+        
+        if(os.path.exists('right_fisheye.npz')):
+            self.right_fisheye_calibration = np.load('right_fisheye.npz')
         
         if(os.path.exists('stereo_calibration.npz')):
             self.stereo_calibration = np.load('stereo_calibration.npz')
+
 
     def rectify_images(self, left_image, right_image):        
         left_camera_matrix = self.stereo_calibration['camera_matrix_left']
@@ -517,6 +567,23 @@ class Calibration:
         right_rectified = cv2.remap(right_image, right_map1, right_map2, cv2.INTER_LINEAR)
 
         return left_rectified, right_rectified
+
+
+    def init_fisheye_maps(self, img, balance, calibration):
+        img_dim = img.shape[:2][::-1]  
+        DIM = (1920, 1080)
+        
+        scaled_K = calibration["K"] * img_dim[0] / DIM[0]  
+        scaled_K[2][2] = 1.0  
+        
+        D = calibration["D"]
+        
+        new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(scaled_K, D,
+            img_dim, np.eye(3), balance=balance)
+        map1, map2 = cv2.fisheye.initUndistortRectifyMap(scaled_K, D, np.eye(3),
+            new_K, img_dim, cv2.CV_16SC2)
+
+        return map1, map2
 
 
     def preview_stereo(self, rectify=True):
@@ -564,6 +631,9 @@ class Calibration:
         
         left_margin = 965
         right_margin = 931
+
+        left_maps = [None, None]
+        right_maps = [None, None]
                 
         while (True):
             left_frame = left_picam.capture_array()
@@ -572,20 +642,29 @@ class Calibration:
             left_frame = cv2.cvtColor(left_frame, cv2.COLOR_BGR2RGB)
             right_frame = cv2.cvtColor(right_frame, cv2.COLOR_BGR2RGB)
             
+            if(left_maps[0] is None):
+                left_maps = self.init_fisheye_maps(left_frame, 1.0, self.left_fisheye_calibration)
+                
+            if(right_maps[0] is None):
+                right_maps = self.init_fisheye_maps(right_frame, 1.0, self.right_fisheye_calibration)
+            
             left_og_frame = left_frame.copy()
             right_og_frame = right_frame.copy()
-            
-            
+                        
             if(rectify == True):
-                left_rectified, right_rectified = self.rectify_images(left_frame, right_frame)
-                height, width = left_rectified.shape[:2]
-        
-                cv2.line(left_rectified,(width - left_margin - 2,0),(width - left_margin - 2, height),(255,0,0),3)
-                                
-                # combined_frame = cv2.hconcat([left_rectified, right_rectified])
-                combined_frame = cv2.hconcat([left_rectified[0:height, 0:width-left_margin], right_rectified[0:height, right_margin:width]])
+                left_undist_image = cv2.remap(left_frame, left_maps[0], left_maps[1], interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+                right_undist_image = cv2.remap(right_frame, right_maps[0], right_maps[1], interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
                 
-                combined_frame = cv2.resize(combined_frame, (combined_frame.shape[1] // 1, combined_frame.shape[0] // 1))
+                # left_rectified, right_rectified = self.rectify_images(left_frame, right_frame)
+                height, width = left_undist_image.shape[:2]
+
+                # undist_image = cv2.remap(img, left_map1, left_map2, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+                # cv2.line(left_rectified,(width - left_margin - 2,0),(width - left_margin - 2, height),(255,0,0),3)
+                                
+                combined_frame = cv2.hconcat([left_undist_image, right_undist_image])
+                # combined_frame = cv2.hconcat([left_rectified[0:height, 0:width-left_margin], right_rectified[0:height, right_margin:width]])
+                
+                combined_frame = cv2.resize(combined_frame, (combined_frame.shape[1] // 3, combined_frame.shape[0] // 3))
                 cv2.imshow('Rectified Images', combined_frame)
             
             else:                
@@ -636,10 +715,10 @@ class Calibration:
 if __name__ == "__main__":
     calibrate = Calibration()
     calibrate.load_calibrations()
-    calibrate.preview_stereo()
+    # calibrate.preview_stereo()
     # calibrate.capture_images(1, "left")
     # calibrate.capture_images(0, "right")
     # calibrate.capture_stereo_images()
-    # calibrate.calibrate("left")
+    # calibrate.calibrate("left", fisheye=True)
     # calibrate.calibrate("right")
-    # calibrate.stereo_calibrate()
+    calibrate.stereo_calibrate()
